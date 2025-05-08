@@ -1,104 +1,117 @@
 """
-Generate transparent EAN‑13 barcodes from column I in an Excel sheet.
+EAN‑13 barcode generator with batch sub‑folders
+----------------------------------------------
 
-• Accepts 12‑ or 13‑digit values (auto‑computes the check‑digit if missing)
-• Renders the bars first, then draws the digits underneath on a larger canvas
-  so nothing is cut off.
-• Writes <full‑13‑digit‑code>.png files into OUTPUT_DIR.
+• Column I … 12/13‑digit GTIN/EAN (auto‑computes check digit if 12)
+• Column F … product description → becomes file name
+• Each run writes PNGs to   OUTPUT_DIR / <YYYY‑MM‑DD_HHMM> /
 """
 
-import os, sys
+import os, sys, re, csv
 from pathlib import Path
+from datetime import datetime
 from barcode import get
 from barcode.writer import ImageWriter
 from openpyxl import load_workbook
 from PIL import Image, ImageDraw, ImageFont
 
-# ========= CONFIGURATION ==============================================
-EXCEL_PATH = r
-SHEET_NAME = "Replaced"
-COLUMN     = "I"
-START_ROW  = 4                 # inclusive
-END_ROW    = 104               # inclusive   (change as needed)
-OUTPUT_DIR = r
-# ======================================================================
-
-# ---------- rendering parameters --------------------------------------
-FONT_PATH   = r"C:\Windows\Fonts\arial.ttf"   # any TrueType font with digits
-FONT_SIZE   = 34                              # try 30‑40 first, tweak later
-SIDE_PAD_MM = 2.0                             # blank margin each side (mm)
-BAR_HEIGHT  = 22                              # bar height (mm) – GS‑1 minimum
+# ========= USER SETTINGS ===================================================
+EXCEL_PATH  = r"C:\Users\DIR.xlsx"
+SHEET_NAME  = "Replaced"
+START_ROW   = 4
+END_ROW     = 104
+CODE_COLUMN = "I"
+DESC_COLUMN = "F"
+OUTPUT_DIR  = Path(r"C:\Users\OUT")  # base folder
+# ---------------------------------------------------------------------------
+FONT_PATH   = r"C:\Windows\Fonts\arial.ttf"
+FONT_SIZE   = 34
+BAR_HEIGHT  = 22        # mm
+SIDE_PAD_MM = 2.0
+GAP_MM      = 0.7
 DPI         = 600
+# ===========================================================================
 
-# pre‑calc millimetres → pixels
-MM_TO_PX = DPI / 25.4
+# ---- derived constants ----------------------------------------------------
+MM_TO_PX   = DPI / 25.4
 side_pad_px = int(SIDE_PAD_MM * MM_TO_PX)
-GAP_MM = 0.1
-gap_px = int(GAP_MM * MM_TO_PX)     # 0.7 mm gap bars ↔ text            
+gap_px      = int(GAP_MM      * MM_TO_PX)
 
-font = ImageFont.truetype(FONT_PATH, FONT_SIZE)
+font   = ImageFont.truetype(FONT_PATH, FONT_SIZE)
+ascent = font.getmetrics()[0]
 
-# ---------- helper: make one PNG --------------------------------------
-def make_ean_png(code: str, outdir: str = OUTPUT_DIR) -> str:
-    """
-    Build a transparent PNG with scan bars + centred digits underneath.
-    Returns the full 13‑digit code actually encoded.
-    """
+# ---- batch sub‑folder ------------------------------------------------------
+STAMP      = datetime.now().strftime("%Y-%m-%d_%H%M")
+BATCH_DIR  = OUTPUT_DIR / STAMP
+BATCH_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---- helper functions ------------------------------------------------------
+def safe_name(label: str) -> str:
+    """Filesystem‑safe: replace forbidden chars, trim/underscore spaces."""
+    label = re.sub(r'[\/:*?"<>|\\]', "_", label)
+    return label.strip().replace(" ", "_")[:150]
+
+def build_bar_image(base12: str):
+    """Return a PIL Image with bars only."""
+    opts = {
+        "module_width": 0.33,
+        "module_height": BAR_HEIGHT,
+        "quiet_zone": SIDE_PAD_MM,
+        "write_text": False,
+        "dpi": DPI,
+        "mode": "RGBA",
+        "background": (255, 255, 255, 0),
+    }
+    return get("ean13", base12, writer=ImageWriter()).render(opts)
+
+def save_ean(code: str, label: str) -> str:
+    """Generate PNG in BATCH_DIR.  Return full 13‑digit GTIN."""
     if len(code) not in (12, 13) or not code.isdigit():
-        raise ValueError("value must be 12 or 13 digits")
+        raise ValueError("code must be 12 or 13 digits")
 
     base = code[:12]
     full = get("ean13", base).get_fullcode()
 
-    # 1) render BAR image directly in memory  ---------------------------
-    writer_opts = {
-        "module_width" : 0.33,
-        "module_height": BAR_HEIGHT,
-        "quiet_zone"   : SIDE_PAD_MM,
-        "dpi"          : DPI,
-        "write_text"   : False,
-        "mode"         : "RGBA",
-        "background"   : (255, 255, 255, 0),
-    }
-    bars = get("ean13", base, writer=ImageWriter()).render(writer_opts)
+    bars = build_bar_image(base)
     bw, bh = bars.size
 
-    # 2) prepare final canvas  ------------------------------------------
     text_w, text_h = font.getbbox(full)[2:]
-    final_w = max(bw, text_w) + side_pad_px * 2
-    final_h = bh + gap_px + text_h
-    canvas = Image.new("RGBA", (final_w, final_h), (255, 255, 255, 0))
+    canvas_w = max(bw, text_w) + side_pad_px * 2
+    canvas_h = bh + gap_px + ascent
 
-    # 3) paste bars + text  ---------------------------------------------
-    canvas.paste(bars, ((final_w - bw) // 2, 0), bars)
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 0))
+    canvas.paste(bars, ((canvas_w - bw)//2, 0), bars)
+
     draw = ImageDraw.Draw(canvas)
-    draw.text(((final_w - text_w) // 2, bh + gap_px),
-              full, font=font, fill=(0, 0, 0, 255))
+    text_x = (canvas_w - text_w)//2
+    text_y = bh + gap_px - (ascent - text_h)
+    draw.text((text_x, text_y), full, font=font, fill=(0, 0, 0, 255))
 
-    # 4) save final PNG  -------------------------------------------------
-    out_path = Path(outdir, f"{full}.png")
+    fname = safe_name(label) if label else full
+    out_path = BATCH_DIR / f"{fname}.png"
     canvas.save(out_path, "PNG")
-    return full
+    return full, out_path
 
-# ---------- main loop -------------------------------------------------
-if not os.path.isfile(EXCEL_PATH):
-    sys.exit(f"❌  Excel file not found: {EXCEL_PATH}")
+# ---- main loop -------------------------------------------------------------
+if not Path(EXCEL_PATH).is_file():
+    sys.exit(f"❌ Excel file not found: {EXCEL_PATH}")
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 wb    = load_workbook(EXCEL_PATH, data_only=True)
 sheet = wb[SHEET_NAME]
 
 ok, skip = 0, 0
 for row in range(START_ROW, END_ROW + 1):
-    raw = str(sheet[f"{COLUMN}{row}"].value or "").strip()
-    if not raw:
+    code  = str(sheet[f"{CODE_COLUMN}{row}"].value or "").strip()
+    label = str(sheet[f"{DESC_COLUMN}{row}"].value or "").strip()
+
+    if not code:
         continue
     try:
-        full = make_ean_png(raw)
+        gtin, path = save_ean(code, label)
         ok += 1
-        print("✅", full)
+        print(f"✅ Row {row}: {gtin} → {path.relative_to(OUTPUT_DIR)}")
     except Exception as e:
         skip += 1
-        print(f"⚠️  Row {row}: {e}")
+        print(f"⚠️ Row {row}: {e}")
 
-print(f"\nDone: {ok} barcodes created, {skip} skipped.")
+print(f"\nFinished: {ok} barcodes written to “{BATCH_DIR.name}”, {skip} skipped.")
